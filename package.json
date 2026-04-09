@@ -4,14 +4,25 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "party:dev": "partykit dev",
+    "party:deploy": "partykit deploy",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@react-three/cannon": "^6.6.0",
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
+    "@types/three": "^0.183.1",
+    "lucide-react": "^1.8.0",
     "next": "16.2.3",
+    "partykit": "^0.0.115",
+    "partysocket": "^1.1.16",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "three": "^0.183.2",
+    "yjs": "^13.6.30"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

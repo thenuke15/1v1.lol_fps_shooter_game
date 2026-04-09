@@ -1,65 +1,541 @@
-import Image from "next/image";
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Physics, useBox, usePlane, useSphere } from "@react-three/cannon";
+import { usePartySocket } from "partysocket/react";
+import * as THREE from "three";
+
+type BuildType = "wall";
+
+type BuildPieceData = {
+  id: string;
+  type: BuildType;
+  position: [number, number, number];
+  rotation: [number, number, number];
+};
+
+type RemotePlayer = {
+  id: string;
+  position: [number, number, number];
+  rotation: [number, number, number];
+};
+
+type GhostData = {
+  type: BuildType;
+  position: [number, number, number];
+  rotation: [number, number, number];
+  canPlace: boolean;
+};
+
+type NetMessage =
+  | { type: "initState"; players: RemotePlayer[]; builds: BuildPieceData[]; online: number }
+  | { type: "playerJoined"; player: RemotePlayer; online: number }
+  | { type: "playerLeft"; id: string; online: number }
+  | { type: "playerMoved"; player: RemotePlayer }
+  | { type: "buildPlaced"; build: BuildPieceData; online: number };
+
+const GRID_SIZE = 3;
+const BUILD_RANGE = 12;
+
+function snapToGrid(value: number) {
+  return Math.round(value / GRID_SIZE) * GRID_SIZE;
+}
+
+function getPieceSize(): [number, number, number] {
+  return [3, 3, 0.5];
+}
+
+function getYawHalfExtents(type: BuildType, yaw: number): [number, number, number] {
+  const [sx, sy, sz] = getPieceSize(type);
+  const normalizedYaw = ((yaw % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  const quarterTurns = Math.round(normalizedYaw / (Math.PI / 2)) % 4;
+  const swapXZ = quarterTurns % 2 === 1;
+  const finalX = swapXZ ? sz : sx;
+  const finalZ = swapXZ ? sx : sz;
+  return [finalX / 2, sy / 2, finalZ / 2];
+}
+
+function boxesOverlap(a: Omit<BuildPieceData, "id">, b: Omit<BuildPieceData, "id">) {
+  const aHalf = getYawHalfExtents(a.type, a.rotation[1]);
+  const bHalf = getYawHalfExtents(b.type, b.rotation[1]);
+  const epsilon = 0.01;
+
+  return (
+    Math.abs(a.position[0] - b.position[0]) < aHalf[0] + bHalf[0] - epsilon &&
+    Math.abs(a.position[1] - b.position[1]) < aHalf[1] + bHalf[1] - epsilon &&
+    Math.abs(a.position[2] - b.position[2]) < aHalf[2] + bHalf[2] - epsilon
+  );
+}
+
+function canPlacePiece(
+  candidate: Omit<BuildPieceData, "id">,
+  placedPieces: BuildPieceData[],
+  playerPosition: [number, number, number],
+) {
+  const distanceXZ = Math.hypot(
+    candidate.position[0] - playerPosition[0],
+    candidate.position[2] - playerPosition[2],
+  );
+
+  if (distanceXZ > BUILD_RANGE) {
+    return false;
+  }
+
+  return !placedPieces.some((piece) => boxesOverlap(candidate, piece));
+}
+
+function getBuildTransform(type: BuildType, camera: THREE.Camera, yawOffset: number) {
+  const direction = new THREE.Vector3();
+  camera.getWorldDirection(direction);
+  direction.y = 0;
+  if (direction.lengthSq() === 0) {
+    direction.set(0, 0, -1);
+  } else {
+    direction.normalize();
+  }
+
+  const distanceAhead = 5;
+  const rawX = camera.position.x + direction.x * distanceAhead;
+  const rawZ = camera.position.z + direction.z * distanceAhead;
+  const yaw = Math.atan2(direction.x, direction.z);
+  const snappedYaw = Math.round(yaw / (Math.PI / 2)) * (Math.PI / 2) + yawOffset;
+
+  return {
+    position: [snapToGrid(rawX), 1.5, snapToGrid(rawZ)] as [number, number, number],
+    rotation: [0, snappedYaw, 0] as [number, number, number],
+  };
+}
+
+function BuildPiece({ type, position, rotation }: Omit<BuildPieceData, "id">) {
+  const boxArgs = getPieceSize(type);
+
+  const [ref] = useBox(() => ({
+    type: "Static",
+    args: boxArgs,
+    position,
+    rotation,
+  }));
+
+  return (
+    <mesh ref={ref} castShadow receiveShadow>
+      <boxGeometry args={boxArgs} />
+      <meshStandardMaterial color="#2f6dff" />
+    </mesh>
+  );
+}
+
+function RemotePlayerCapsule({ player }: { player: RemotePlayer }) {
+  return (
+    <mesh position={player.position} rotation={player.rotation} castShadow>
+      <capsuleGeometry args={[0.3, 0.7, 8, 16]} />
+      <meshStandardMaterial color="#ef4444" />
+    </mesh>
+  );
+}
+
+function GhostPiece({ ghost }: { ghost: GhostData | null }) {
+  if (!ghost) {
+    return null;
+  }
+
+  const boxArgs = getPieceSize(ghost.type);
+
+  return (
+    <mesh position={ghost.position} rotation={ghost.rotation}>
+      <boxGeometry args={boxArgs} />
+      <meshStandardMaterial
+        color={ghost.canPlace ? "#2f6dff" : "#ef4444"}
+        transparent
+        opacity={0.35}
+      />
+    </mesh>
+  );
+}
+
+function ArenaFloor() {
+  const [ref] = usePlane(() => ({
+    rotation: [-Math.PI / 2, 0, 0],
+    position: [0, 0, 0],
+    type: "Static",
+  }));
+
+  const gridTexture = useMemo(() => {
+    const size = 256;
+    const cell = 32;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.fillStyle = "#e9ecef";
+    ctx.fillRect(0, 0, size, size);
+    ctx.strokeStyle = "#d0d4d9";
+    ctx.lineWidth = 2;
+
+    for (let i = 0; i <= size; i += cell) {
+      ctx.beginPath();
+      ctx.moveTo(i, 0);
+      ctx.lineTo(i, size);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, i);
+      ctx.lineTo(size, i);
+      ctx.stroke();
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(40, 40);
+    texture.anisotropy = 8;
+    texture.colorSpace = THREE.SRGBColorSpace;
+
+    return texture;
+  }, []);
+
+  return (
+    <mesh ref={ref}>
+      <planeGeometry args={[300, 300]} />
+      <meshStandardMaterial map={gridTexture ?? undefined} color="#dfe3e8" />
+    </mesh>
+  );
+}
+
+type PlayerControllerProps = {
+  placedPieces: BuildPieceData[];
+  buildMode: boolean;
+  onToggleBuildMode: () => void;
+  onPlaceBuild: (piece: Omit<BuildPieceData, "id">) => void;
+  onPlayerTransform: (position: [number, number, number], rotation: [number, number, number]) => void;
+};
+
+function PlayerController({
+  placedPieces,
+  buildMode,
+  onToggleBuildMode,
+  onPlaceBuild,
+  onPlayerTransform,
+}: PlayerControllerProps) {
+  const { camera, gl } = useThree();
+  const [playerRef, api] = useSphere(() => ({
+    mass: 1,
+    args: [0.45],
+    position: [0, 2, 0],
+    linearDamping: 0.85,
+    angularDamping: 1,
+    fixedRotation: true,
+  }));
+
+  const velocity = useRef<[number, number, number]>([0, 0, 0]);
+  const position = useRef<[number, number, number]>([0, 2, 0]);
+  const keys = useRef<Record<string, boolean>>({});
+  const yaw = useRef(0);
+  const pitch = useRef(0);
+  const buildYawOffset = useRef(0);
+  const [ghost, setGhost] = useState<GhostData | null>(null);
+  const ghostRef = useRef<GhostData | null>(null);
+  const eyeHeight = 0.55;
+  const speed = 7;
+  const jumpForce = 6;
+  const syncAccumulator = useRef(0);
+
+  useEffect(() => api.velocity.subscribe((v) => (velocity.current = v)), [api.velocity]);
+  useEffect(() => api.position.subscribe((p) => (position.current = p)), [api.position]);
+  useEffect(() => {
+    ghostRef.current = ghost;
+  }, [ghost]);
+
+  useEffect(() => {
+    const onClick = () => {
+      if (document.pointerLockElement !== gl.domElement) {
+        gl.domElement.requestPointerLock();
+      }
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      keys.current[event.code] = true;
+
+      if (event.code === "KeyQ") {
+        onToggleBuildMode();
+      } else if (event.code === "KeyR") {
+        buildYawOffset.current += Math.PI / 2;
+      }
+
+      if (event.code === "Space") {
+        const nearGround = Math.abs(position.current[1] - 0.45) < 0.2;
+        const lowVerticalSpeed = Math.abs(velocity.current[1]) < 0.1;
+        if (nearGround && lowVerticalSpeed) {
+          api.velocity.set(velocity.current[0], jumpForce, velocity.current[2]);
+        }
+      }
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      keys.current[event.code] = false;
+    };
+
+    const onMouseMove = (event: MouseEvent) => {
+      if (document.pointerLockElement !== gl.domElement) {
+        return;
+      }
+
+      const sensitivity = 0.0022;
+      yaw.current -= event.movementX * sensitivity;
+      pitch.current -= event.movementY * sensitivity;
+      pitch.current = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, pitch.current));
+    };
+
+    const onMouseDown = (event: MouseEvent) => {
+      const currentGhost = ghostRef.current;
+      if (
+        event.button !== 0 ||
+        document.pointerLockElement !== gl.domElement ||
+        !buildMode ||
+        !currentGhost ||
+        !currentGhost.canPlace
+      ) {
+        return;
+      }
+
+      onPlaceBuild({
+        type: currentGhost.type,
+        position: currentGhost.position,
+        rotation: currentGhost.rotation,
+      });
+    };
+
+    gl.domElement.addEventListener("click", onClick);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mousedown", onMouseDown);
+
+    return () => {
+      gl.domElement.removeEventListener("click", onClick);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mousedown", onMouseDown);
+    };
+  }, [api.velocity, buildMode, gl.domElement, onPlaceBuild, onToggleBuildMode]);
+
+  useFrame((_, delta) => {
+    const forward = Number(keys.current.KeyW) - Number(keys.current.KeyS);
+    const strafe = Number(keys.current.KeyD) - Number(keys.current.KeyA);
+
+    const dir = new THREE.Vector3(strafe, 0, -forward);
+    if (dir.lengthSq() > 0) {
+      dir.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw.current);
+    }
+
+    api.velocity.set(dir.x * speed, velocity.current[1], dir.z * speed);
+
+    camera.position.set(position.current[0], position.current[1] + eyeHeight, position.current[2]);
+    camera.rotation.set(pitch.current, yaw.current, 0, "YXZ");
+
+    const snapped = getBuildTransform("wall", camera, buildYawOffset.current);
+    const canPlace = canPlacePiece(
+      {
+        type: "wall",
+        position: snapped.position,
+        rotation: snapped.rotation,
+      },
+      placedPieces,
+      position.current,
+    );
+
+    setGhost((prev) => {
+      if (
+        prev &&
+        prev.type === "wall" &&
+        prev.position[0] === snapped.position[0] &&
+        prev.position[1] === snapped.position[1] &&
+        prev.position[2] === snapped.position[2] &&
+        prev.rotation[0] === snapped.rotation[0] &&
+        prev.rotation[1] === snapped.rotation[1] &&
+        prev.rotation[2] === snapped.rotation[2] &&
+        prev.canPlace === canPlace
+      ) {
+        return prev;
+      }
+
+      return {
+        type: "wall",
+        position: snapped.position,
+        rotation: snapped.rotation,
+        canPlace,
+      };
+    });
+
+    syncAccumulator.current += delta;
+    if (syncAccumulator.current > 0.05) {
+      syncAccumulator.current = 0;
+      onPlayerTransform(position.current, [pitch.current, yaw.current, 0]);
+    }
+  });
+
+  return (
+    <>
+      <mesh ref={playerRef} castShadow position={[0, 2, 0]}>
+        <capsuleGeometry args={[0.3, 0.7, 8, 16]} />
+        <meshStandardMaterial color="#3f6ed4" />
+      </mesh>
+      {buildMode ? <GhostPiece ghost={ghost} /> : null}
+    </>
+  );
+}
+
+const PARTY_HOST = (
+  process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? "https://my-1v1-clone.thenuke15.partykit.dev"
+)
+  .replace(/^https?:\/\//, "")
+  .replace(/\/+$/, "");
+const PARTY_ROOM = process.env.NEXT_PUBLIC_PARTYKIT_ROOM ?? "arena-room";
+const PARTY_NAME = "arena";
+
+type ArenaSceneProps = {
+  onOnlineChange: (count: number) => void;
+  buildMode: boolean;
+  onToggleBuildMode: () => void;
+};
+
+function ArenaScene({ onOnlineChange, buildMode, onToggleBuildMode }: ArenaSceneProps) {
+  const [builds, setBuilds] = useState<BuildPieceData[]>([]);
+  const [remotePlayers, setRemotePlayers] = useState<Record<string, RemotePlayer>>({});
+  const onMessage = useCallback(
+    (event: MessageEvent) => {
+      const message = JSON.parse(event.data as string) as NetMessage;
+      if (message.type === "initState") {
+        setBuilds(message.builds);
+        const nextPlayers: Record<string, RemotePlayer> = {};
+        for (const player of message.players) {
+          nextPlayers[player.id] = player;
+        }
+        setRemotePlayers(nextPlayers);
+        onOnlineChange(message.online);
+      } else if (message.type === "playerJoined") {
+        setRemotePlayers((prev) => ({ ...prev, [message.player.id]: message.player }));
+        onOnlineChange(message.online);
+      } else if (message.type === "playerLeft") {
+        setRemotePlayers((prev) => {
+          const next = { ...prev };
+          delete next[message.id];
+          return next;
+        });
+        onOnlineChange(message.online);
+      } else if (message.type === "playerMoved") {
+        setRemotePlayers((prev) => ({ ...prev, [message.player.id]: message.player }));
+      } else if (message.type === "buildPlaced") {
+        setBuilds((prev) => {
+          if (prev.some((build) => build.id === message.build.id)) {
+            return prev;
+          }
+          return [...prev, message.build];
+        });
+        onOnlineChange(message.online);
+      }
+    },
+    [onOnlineChange],
+  );
+
+  const socket = usePartySocket({
+    host: PARTY_HOST,
+    room: PARTY_ROOM,
+    party: PARTY_NAME,
+    onMessage,
+  });
+
+  const handlePlaceBuild = (piece: Omit<BuildPieceData, "id">) => {
+    socket.send(
+      JSON.stringify({
+        type: "placeBuild",
+        build: piece,
+      }),
+    );
+  };
+
+  const handlePlayerTransform = (
+    position: [number, number, number],
+    rotation: [number, number, number],
+  ) => {
+    socket.send(
+      JSON.stringify({
+        type: "playerMove",
+        position,
+        rotation,
+      }),
+    );
+  };
+
+  return (
+    <>
+      <color attach="background" args={["#91cbff"]} />
+      <fog attach="fog" args={["#91cbff", 18, 140]} />
+      <ambientLight intensity={0.5} />
+      <directionalLight
+        position={[10, 16, 7]}
+        intensity={1}
+        castShadow
+        shadow-mapSize-width={2048}
+        shadow-mapSize-height={2048}
+      />
+      <Physics gravity={[0, -20, 0]}>
+        <ArenaFloor />
+        <PlayerController
+          placedPieces={builds}
+          buildMode={buildMode}
+          onToggleBuildMode={onToggleBuildMode}
+          onPlaceBuild={handlePlaceBuild}
+          onPlayerTransform={handlePlayerTransform}
+        />
+        {builds.map((piece) => (
+          <BuildPiece
+            key={piece.id}
+            type={piece.type}
+            position={piece.position}
+            rotation={piece.rotation}
+          />
+        ))}
+        {Object.values(remotePlayers).map((player) => (
+          <RemotePlayerCapsule key={player.id} player={player} />
+        ))}
+      </Physics>
+    </>
+  );
+}
 
 export default function Home() {
+  const [online, setOnline] = useState(1);
+  const [buildMode, setBuildMode] = useState(false);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <div className="relative h-screen w-screen overflow-hidden bg-[#91cbff]">
+      <Canvas shadows camera={{ position: [0, 2, 5], fov: 75 }}>
+        <ArenaScene
+          onOnlineChange={setOnline}
+          buildMode={buildMode}
+          onToggleBuildMode={() => setBuildMode((prev) => !prev)}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+      </Canvas>
+
+      {!buildMode ? (
+        <div className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2">
+          <div className="absolute left-1/2 top-0 h-4 w-[2px] -translate-x-1/2 bg-white/90" />
+          <div className="absolute left-0 top-1/2 h-[2px] w-4 -translate-y-1/2 bg-white/90" />
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+      ) : null}
+
+      <div className="pointer-events-none absolute right-4 top-4 rounded-md bg-black/35 px-3 py-2 text-sm text-white">
+        Players Online: {online}
+      </div>
+      <div className="pointer-events-none absolute left-4 top-4 rounded-md bg-black/35 px-3 py-2 text-sm text-white">
+        Mode: {buildMode ? "Build (Q)" : "Combat (Q)"}
+      </div>
     </div>
   );
 }
