@@ -134,24 +134,33 @@ function RemotePlayerCapsule({ player }: { player: RemotePlayer }) {
   );
 }
 
-function GhostPiece({ ghost }: { ghost: GhostData | null }) {
-  if (!ghost) {
-    return null;
-  }
-
+const GhostPiece = ({ ghostRef }: { ghostRef: React.RefObject<GhostData | null> }) => {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const materialRef = useRef<THREE.MeshStandardMaterial>(null);
   const boxArgs = getPieceSize();
 
+  useFrame(() => {
+    const ghost = ghostRef.current;
+    if (!meshRef.current || !materialRef.current) return;
+
+    if (!ghost) {
+      meshRef.current.visible = false;
+      return;
+    }
+
+    meshRef.current.visible = true;
+    meshRef.current.position.set(...ghost.position);
+    meshRef.current.rotation.set(...ghost.rotation);
+    materialRef.current.color.set(ghost.canPlace ? "#2f6dff" : "#ef4444");
+  });
+
   return (
-    <mesh position={ghost.position} rotation={ghost.rotation}>
+    <mesh ref={meshRef} visible={false}>
       <boxGeometry args={boxArgs} />
-      <meshStandardMaterial
-        color={ghost.canPlace ? "#2f6dff" : "#ef4444"}
-        transparent
-        opacity={0.35}
-      />
+      <meshStandardMaterial ref={materialRef} transparent opacity={0.35} />
     </mesh>
   );
-}
+};
 
 function ArenaFloor() {
   const halfExtents: [number, number, number] = [150, 0.5, 150];
@@ -244,7 +253,6 @@ function PlayerController({
   const yaw = useRef(0);
   const pitch = useRef(0);
   const buildYawOffset = useRef(0);
-  const [ghost, setGhost] = useState<GhostData | null>(null);
   const ghostRef = useRef<GhostData | null>(null);
   const camDistance = 5.5;
   const camHeight = 1.85;
@@ -255,9 +263,6 @@ function PlayerController({
 
   useEffect(() => api.velocity.subscribe((v) => (velocity.current = v)), [api.velocity]);
   useEffect(() => api.position.subscribe((p) => (position.current = p)), [api.position]);
-  useEffect(() => {
-    ghostRef.current = ghost;
-  }, [ghost]);
 
   useEffect(() => {
     const onClick = () => {
@@ -374,28 +379,13 @@ function PlayerController({
       position.current,
     );
 
-    setGhost((prev) => {
-      if (
-        prev &&
-        prev.type === "wall" &&
-        prev.position[0] === snapped.position[0] &&
-        prev.position[1] === snapped.position[1] &&
-        prev.position[2] === snapped.position[2] &&
-        prev.rotation[0] === snapped.rotation[0] &&
-        prev.rotation[1] === snapped.rotation[1] &&
-        prev.rotation[2] === snapped.rotation[2] &&
-        prev.canPlace === canPlace
-      ) {
-        return prev;
-      }
-
-      return {
-        type: "wall",
-        position: snapped.position,
-        rotation: snapped.rotation,
-        canPlace,
-      };
-    });
+    // Update ghost ref directly - no state to avoid re-renders
+    ghostRef.current = {
+      type: "wall",
+      position: snapped.position,
+      rotation: snapped.rotation,
+      canPlace,
+    };
 
     syncAccumulator.current += delta;
     if (syncAccumulator.current > 0.05) {
@@ -410,7 +400,7 @@ function PlayerController({
         <capsuleGeometry args={[0.3, 0.7, 8, 16]} />
         <meshStandardMaterial color="#3f6ed4" />
       </mesh>
-      {buildMode ? <GhostPiece ghost={ghost} /> : null}
+      {buildMode ? <GhostPiece ghostRef={ghostRef} /> : null}
     </>
   );
 }
