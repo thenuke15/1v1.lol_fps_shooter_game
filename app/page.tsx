@@ -46,8 +46,8 @@ function getPieceSize(): [number, number, number] {
   return [3, 3, 0.5];
 }
 
-function getYawHalfExtents(type: BuildType, yaw: number): [number, number, number] {
-  const [sx, sy, sz] = getPieceSize(type);
+function getYawHalfExtents(_type: BuildType, yaw: number): [number, number, number] {
+  const [sx, sy, sz] = getPieceSize();
   const normalizedYaw = ((yaw % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
   const quarterTurns = Math.round(normalizedYaw / (Math.PI / 2)) % 4;
   const swapXZ = quarterTurns % 2 === 1;
@@ -107,8 +107,8 @@ function getBuildTransform(type: BuildType, camera: THREE.Camera, yawOffset: num
   };
 }
 
-function BuildPiece({ type, position, rotation }: Omit<BuildPieceData, "id">) {
-  const boxArgs = getPieceSize(type);
+function BuildPiece({ position, rotation }: Pick<BuildPieceData, "position" | "rotation">) {
+  const boxArgs = getPieceSize();
 
   const [ref] = useBox(() => ({
     type: "Static",
@@ -139,7 +139,7 @@ function GhostPiece({ ghost }: { ghost: GhostData | null }) {
     return null;
   }
 
-  const boxArgs = getPieceSize(ghost.type);
+  const boxArgs = getPieceSize();
 
   return (
     <mesh position={ghost.position} rotation={ghost.rotation}>
@@ -494,12 +494,7 @@ function ArenaScene({ onOnlineChange, buildMode, onToggleBuildMode }: ArenaScene
           onPlayerTransform={handlePlayerTransform}
         />
         {builds.map((piece) => (
-          <BuildPiece
-            key={piece.id}
-            type={piece.type}
-            position={piece.position}
-            rotation={piece.rotation}
-          />
+          <BuildPiece key={piece.id} position={piece.position} rotation={piece.rotation} />
         ))}
         {Object.values(remotePlayers).map((player) => (
           <RemotePlayerCapsule key={player.id} player={player} />
