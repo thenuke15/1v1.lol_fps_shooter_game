@@ -1,5 +1,8 @@
 {
   "name": "my-1v1-clone",
   "main": "party/index.ts",
+  "parties": {
+    "arena": "party/index.ts"
+  },
   "compatibilityDate": "2026-04-09"
 }

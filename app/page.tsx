@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Physics, useBox, usePlane, useSphere } from "@react-three/cannon";
+import { Physics, useBox, useSphere } from "@react-three/cannon";
 import { usePartySocket } from "partysocket/react";
 import * as THREE from "three";
 
@@ -85,21 +85,20 @@ function canPlacePiece(
   return !placedPieces.some((piece) => boxesOverlap(candidate, piece));
 }
 
-function getBuildTransform(type: BuildType, camera: THREE.Camera, yawOffset: number) {
-  const direction = new THREE.Vector3();
-  camera.getWorldDirection(direction);
-  direction.y = 0;
-  if (direction.lengthSq() === 0) {
-    direction.set(0, 0, -1);
-  } else {
-    direction.normalize();
-  }
-
+/** Wall preview/placement uses player facing (third-person camera looks at player, not forward). */
+function getBuildTransformFromPlayerYaw(
+  px: number,
+  pz: number,
+  playerYaw: number,
+  yawOffset: number,
+) {
+  const dirX = Math.sin(playerYaw);
+  const dirZ = -Math.cos(playerYaw);
   const distanceAhead = 5;
-  const rawX = camera.position.x + direction.x * distanceAhead;
-  const rawZ = camera.position.z + direction.z * distanceAhead;
-  const yaw = Math.atan2(direction.x, direction.z);
-  const snappedYaw = Math.round(yaw / (Math.PI / 2)) * (Math.PI / 2) + yawOffset;
+  const rawX = px + dirX * distanceAhead;
+  const rawZ = pz + dirZ * distanceAhead;
+  const planeYaw = Math.atan2(dirX, dirZ);
+  const snappedYaw = Math.round(planeYaw / (Math.PI / 2)) * (Math.PI / 2) + yawOffset;
 
   return {
     position: [snapToGrid(rawX), 1.5, snapToGrid(rawZ)] as [number, number, number],
@@ -126,8 +125,9 @@ function BuildPiece({ position, rotation }: Pick<BuildPieceData, "position" | "r
 }
 
 function RemotePlayerCapsule({ player }: { player: RemotePlayer }) {
+  const [, yaw] = player.rotation;
   return (
-    <mesh position={player.position} rotation={player.rotation} castShadow>
+    <mesh position={player.position} rotation={[0, yaw, 0]} castShadow>
       <capsuleGeometry args={[0.3, 0.7, 8, 16]} />
       <meshStandardMaterial color="#ef4444" />
     </mesh>
@@ -154,27 +154,31 @@ function GhostPiece({ ghost }: { ghost: GhostData | null }) {
 }
 
 function ArenaFloor() {
-  const [ref] = usePlane(() => ({
-    rotation: [-Math.PI / 2, 0, 0],
-    position: [0, 0, 0],
+  const halfExtents: [number, number, number] = [150, 0.5, 150];
+  const [ref] = useBox(() => ({
     type: "Static",
+    args: halfExtents,
+    position: [0, -halfExtents[1], 0],
   }));
 
   const gridTexture = useMemo(() => {
+    if (typeof document === "undefined") {
+      return null;
+    }
+
     const size = 256;
     const cell = 32;
     const canvas = document.createElement("canvas");
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext("2d");
-
     if (!ctx) {
       return null;
     }
 
     ctx.fillStyle = "#e9ecef";
     ctx.fillRect(0, 0, size, size);
-    ctx.strokeStyle = "#d0d4d9";
+    ctx.strokeStyle = "#c8ced6";
     ctx.lineWidth = 2;
 
     for (let i = 0; i <= size; i += cell) {
@@ -198,9 +202,15 @@ function ArenaFloor() {
     return texture;
   }, []);
 
+  useEffect(() => {
+    return () => {
+      gridTexture?.dispose();
+    };
+  }, [gridTexture]);
+
   return (
-    <mesh ref={ref}>
-      <planeGeometry args={[300, 300]} />
+    <mesh ref={ref} receiveShadow>
+      <boxGeometry args={[halfExtents[0] * 2, halfExtents[1] * 2, halfExtents[2] * 2]} />
       <meshStandardMaterial map={gridTexture ?? undefined} color="#dfe3e8" />
     </mesh>
   );
@@ -229,6 +239,7 @@ function PlayerController({
     linearDamping: 0.85,
     angularDamping: 1,
     fixedRotation: true,
+    material: { friction: 0.35, restitution: 0 },
   }));
 
   const velocity = useRef<[number, number, number]>([0, 0, 0]);
@@ -239,7 +250,9 @@ function PlayerController({
   const buildYawOffset = useRef(0);
   const [ghost, setGhost] = useState<GhostData | null>(null);
   const ghostRef = useRef<GhostData | null>(null);
-  const eyeHeight = 0.55;
+  const camDistance = 5.5;
+  const camHeight = 1.85;
+  const lookAtY = 0.9;
   const speed = 7;
   const jumpForce = 6;
   const syncAccumulator = useRef(0);
@@ -325,6 +338,12 @@ function PlayerController({
   }, [api.velocity, buildMode, gl.domElement, onPlaceBuild, onToggleBuildMode]);
 
   useFrame((_, delta) => {
+    if (position.current[1] < -12) {
+      api.position.set(0, 2, 0);
+      api.velocity.set(0, 0, 0);
+      return;
+    }
+
     const forward = Number(keys.current.KeyW) - Number(keys.current.KeyS);
     const strafe = Number(keys.current.KeyD) - Number(keys.current.KeyA);
 
@@ -335,10 +354,20 @@ function PlayerController({
 
     api.velocity.set(dir.x * speed, velocity.current[1], dir.z * speed);
 
-    camera.position.set(position.current[0], position.current[1] + eyeHeight, position.current[2]);
-    camera.rotation.set(pitch.current, yaw.current, 0, "YXZ");
+    const [px, py, pz] = position.current;
 
-    const snapped = getBuildTransform("wall", camera, buildYawOffset.current);
+    api.rotation.set(0, yaw.current, 0);
+
+    const sinY = Math.sin(yaw.current);
+    const cosY = Math.cos(yaw.current);
+    const backX = -sinY;
+    const backZ = cosY;
+    const horizDist = Math.max(0.35, Math.cos(pitch.current)) * camDistance;
+    const vertLift = Math.sin(pitch.current) * camDistance * 0.45 + camHeight;
+    camera.position.set(px + backX * horizDist, py + vertLift, pz + backZ * horizDist);
+    camera.lookAt(px, py + lookAtY, pz);
+
+    const snapped = getBuildTransformFromPlayerYaw(px, pz, yaw.current, buildYawOffset.current);
     const canPlace = canPlacePiece(
       {
         type: "wall",
@@ -396,7 +425,8 @@ const PARTY_HOST = (
   .replace(/^https?:\/\//, "")
   .replace(/\/+$/, "");
 const PARTY_ROOM = process.env.NEXT_PUBLIC_PARTYKIT_ROOM ?? "arena-room";
-const PARTY_NAME = "arena";
+/** Must match a party route on your PartyKit worker. Default `main` matches `main` in partykit.json. */
+const PARTY_NAME = process.env.NEXT_PUBLIC_PARTYKIT_PARTY ?? "main";
 
 type ArenaSceneProps = {
   onOnlineChange: (count: number) => void;
@@ -484,7 +514,13 @@ function ArenaScene({ onOnlineChange, buildMode, onToggleBuildMode }: ArenaScene
         shadow-mapSize-width={2048}
         shadow-mapSize-height={2048}
       />
-      <Physics gravity={[0, -20, 0]}>
+      <Physics
+        gravity={[0, -20, 0]}
+        iterations={20}
+        maxSubSteps={12}
+        allowSleep={false}
+        defaultContactMaterial={{ friction: 0.5, restitution: 0 }}
+      >
         <ArenaFloor />
         <PlayerController
           placedPieces={builds}
@@ -510,13 +546,19 @@ export default function Home() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#91cbff]">
-      <Canvas shadows camera={{ position: [0, 2, 5], fov: 75 }}>
+      <div className="absolute inset-0 min-h-0">
+        <Canvas
+          shadows={{ type: THREE.PCFShadowMap }}
+          className="block h-full w-full touch-none"
+          camera={{ position: [0, 6, 14], fov: 55 }}
+        >
         <ArenaScene
           onOnlineChange={setOnline}
           buildMode={buildMode}
           onToggleBuildMode={() => setBuildMode((prev) => !prev)}
         />
-      </Canvas>
+        </Canvas>
+      </div>
 
       {!buildMode ? (
         <div className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2">
